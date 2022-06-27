@@ -1,0 +1,24 @@
+[package]
+name    = "libclient"
+version = "0.1.0"
+edition = "2021"
+authors = ["ptr64"]
+
+[lib]
+name    = "libclient"
+path    = "src/lib.rs"
+
+[dependencies.anyhow]
+version = "1.0"
+
+[dependencies.bytes]
+version = "1.1.0"
+
+[dependencies.crc]
+version = "3.0.0"
+
+[dependencies.tempfile]
+version = "3.3.0"
+
+[dependencies.thiserror]
+version = "1.0"
