@@ -107,7 +107,7 @@ fn write_contents(
 ///
 /// # Arguments
 /// * `header`  - The header buffer.
-pub fn read_filesystem(mut header: Cursor<&[u8]>) -> anyhow::Result<Filesystem> {
+pub fn read_filesystem(mut header: Cursor<&[u8]>) -> anyhow::Result<Vec<DirectoryEntry>> {
     let magic = header.read_fixed_length_string(3)?;
     if magic != SAH_HEADER_MAGIC {
         return Err(FilesystemError::InvalidMagicValue(magic).into());
@@ -118,8 +118,7 @@ pub fn read_filesystem(mut header: Cursor<&[u8]>) -> anyhow::Result<Filesystem> 
     header.seek(SeekFrom::Current(40))?;
     let _root_directory_name = header.read_length_prefixed_string()?;
 
-    let contents = read_contents(&mut header)?;
-    Ok(Filesystem { contents })
+    read_contents(&mut header)
 }
 
 /// Read the contents of a directory from an archive header.

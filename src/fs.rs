@@ -1,11 +1,12 @@
 use std::fs::DirEntry;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Debug)]
 pub struct Filesystem {
     pub contents: Vec<DirectoryEntry>,
+    archive_data: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -45,15 +46,25 @@ impl Filesystem {
     /// Initialises a Shaiya filesystem from an existing archive.
     ///
     /// # Arguments
-    /// * `header_path`    - The path to the header.
-    pub fn from_archive(header_path: &Path) -> anyhow::Result<Self> {
+    /// * `header_path` - The path to the header.
+    /// * `data_path`   - The path to the data file.
+    pub fn from_archive(header_path: &Path, data_path: &Path) -> anyhow::Result<Self> {
         let metadata = header_path.metadata()?;
         if !metadata.is_file() {
             return Err(FilesystemError::NotAFile(header_path.into()).into());
         }
 
+        let metadata = data_path.metadata()?;
+        if !metadata.is_file() {
+            return Err(FilesystemError::NotAFile(data_path.into()).into());
+        }
+
         let data = std::fs::read(header_path)?;
-        crate::io::read_filesystem(Cursor::new(data.as_slice()))
+        let contents = crate::io::read_filesystem(Cursor::new(data.as_slice()))?;
+        Ok(Filesystem {
+            contents,
+            archive_data: Some(data_path.into()),
+        })
     }
 
     /// Opens a Shaiya filesystem from a path found on disk.
@@ -71,7 +82,10 @@ impl Filesystem {
             .map(|dir| Self::map_directory(&dir.unwrap()).unwrap())
             .collect::<Vec<_>>();
 
-        Ok(Self { contents })
+        Ok(Self {
+            contents,
+            archive_data: None,
+        })
     }
 
     /// Builds the virtual filesystem to temporary files.
@@ -97,7 +111,74 @@ impl Filesystem {
         crate::io::build_filesystem(self, header, data)
     }
 
-    /// Maps an directory entry on disk, do a virtual filesystem entry.
+    /// Extracts a virtual filesystem to disk.
+    ///
+    /// # Arguments
+    /// * `dest`    - The destination path.
+    pub fn extract(self, dest: &Path) -> anyhow::Result<()> {
+        Self::extract_contents(&self.contents, &self.archive_data, dest)
+    }
+
+    /// Extracts directory entries to disk.
+    ///
+    /// # Arguments
+    /// * `contents`        - The entries to extract.
+    /// * `archive_data`    - The archive data file, if the filesystem contains virtual files.
+    /// * `dest`            - The destination to extract to.
+    fn extract_contents(
+        contents: &[DirectoryEntry],
+        archive_data: &Option<PathBuf>,
+        dest: &Path,
+    ) -> anyhow::Result<()> {
+        std::fs::create_dir_all(dest)?;
+        for entry in contents {
+            match entry {
+                DirectoryEntry::File(file) => match file {
+                    File::Direct(file_path) => {
+                        let src = std::fs::read(&file_path)?;
+
+                        let filename = file_path.file_name().expect("invalid file name");
+                        let filepath = dest.join(filename);
+
+                        let mut dest = std::fs::File::create(&filepath)?;
+                        dest.write_all(&src)?;
+                    }
+                    File::Virtual {
+                        name,
+                        offset,
+                        length,
+                        ..
+                    } => match archive_data {
+                        Some(data) => {
+                            let filepath = dest.join(name);
+                            let mut file = std::fs::File::create(&filepath)?;
+
+                            // Allocate data for the virtual file's data.
+                            let mut buf: Vec<u8> = vec![0; (*length) as usize];
+
+                            // Load the data from the archive file.
+                            let mut data_file = std::fs::File::open(&data)?;
+                            data_file.seek(SeekFrom::Start(*offset))?;
+                            data_file.read_exact(&mut buf)?;
+
+                            // Write the data to the direct file.
+                            file.write_all(&buf)?;
+                        }
+                        None => {
+                            panic!("trying to extract a virtual file with no archive data file!")
+                        }
+                    },
+                },
+                DirectoryEntry::Folder(folder) => {
+                    let subpath = dest.join(&folder.name);
+                    Self::extract_contents(&folder.contents, archive_data, &subpath)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Maps an directory entry on disk, to a virtual filesystem entry.
     ///
     /// # Arguments
     /// * `entry`   - The the disk entry.
