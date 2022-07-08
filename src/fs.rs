@@ -1,3 +1,4 @@
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::fs::DirEntry;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -131,7 +132,7 @@ impl Filesystem {
         dest: &Path,
     ) -> anyhow::Result<()> {
         std::fs::create_dir_all(dest)?;
-        for entry in contents {
+        contents.par_iter().map(|entry| {
             match entry {
                 DirectoryEntry::File(file) => match file {
                     File::Direct(file_path) => {
@@ -142,6 +143,7 @@ impl Filesystem {
 
                         let mut dest = std::fs::File::create(&filepath)?;
                         dest.write_all(&src)?;
+                        Ok(())
                     }
                     File::Virtual {
                         name,
@@ -163,6 +165,7 @@ impl Filesystem {
 
                             // Write the data to the direct file.
                             file.write_all(&buf)?;
+                            Ok(())
                         }
                         None => {
                             panic!("trying to extract a virtual file with no archive data file!")
@@ -172,9 +175,10 @@ impl Filesystem {
                 DirectoryEntry::Folder(folder) => {
                     let subpath = dest.join(&folder.name);
                     Self::extract_contents(&folder.contents, archive_data, &subpath)?;
+                    Ok(())
                 }
             }
-        }
+        }).collect::<anyhow::Result<()>>()?;
         Ok(())
     }
 

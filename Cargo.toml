@@ -20,6 +20,9 @@ version = "1.4.3"
 [dependencies.crc]
 version = "3.0.0"
 
+[dependencies.rayon]
+version = "1.5.3"
+
 [dependencies.tempfile]
 version = "3.3.0"
 
