@@ -1,4 +1,5 @@
 use std::fs::DirEntry;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -25,7 +26,8 @@ pub enum File {
     Virtual {
         name: String,
         offset: u64,
-        length: u64,
+        length: u32,
+        checksum: u32,
     },
 }
 
@@ -33,9 +35,27 @@ pub enum File {
 pub enum FilesystemError {
     #[error("specified path is not a directory {0}")]
     NotADirectory(PathBuf),
+    #[error("specified path is not a file")]
+    NotAFile(PathBuf),
+    #[error("invalid magic value {0}")]
+    InvalidMagicValue(String),
 }
 
 impl Filesystem {
+    /// Initialises a Shaiya filesystem from an existing archive.
+    ///
+    /// # Arguments
+    /// * `header_path`    - The path to the header.
+    pub fn from_archive(header_path: &Path) -> anyhow::Result<Self> {
+        let metadata = header_path.metadata()?;
+        if !metadata.is_file() {
+            return Err(FilesystemError::NotAFile(header_path.into()).into());
+        }
+
+        let data = std::fs::read(header_path)?;
+        crate::io::read_filesystem(Cursor::new(data.as_slice()))
+    }
+
     /// Opens a Shaiya filesystem from a path found on disk.
     ///
     /// # Arguments

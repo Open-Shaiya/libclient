@@ -14,6 +14,9 @@ version = "1.0"
 [dependencies.bytes]
 version = "1.1.0"
 
+[dependencies.byteorder]
+version = "1.4.3"
+
 [dependencies.crc]
 version = "3.0.0"
 

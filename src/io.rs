@@ -1,7 +1,8 @@
-use crate::fs::{DirectoryEntry, File, Filesystem};
+use crate::fs::{DirectoryEntry, File, Filesystem, FilesystemError, Folder};
+use byteorder::{LittleEndian, ReadBytesExt};
 use bytes::{BufMut, BytesMut};
 use crc::{Crc, CRC_32_CKSUM};
-use std::io::Write;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 /// The magic identifier for the header file.
 pub const SAH_HEADER_MAGIC: &str = "SAH";
@@ -102,6 +103,59 @@ fn write_contents(
     Ok(total_files)
 }
 
+/// Constructs a filesystem from an archive header.
+///
+/// # Arguments
+/// * `header`  - The header buffer.
+pub fn read_filesystem(mut header: Cursor<&[u8]>) -> anyhow::Result<Filesystem> {
+    let magic = header.read_fixed_length_string(3)?;
+    if magic != SAH_HEADER_MAGIC {
+        return Err(FilesystemError::InvalidMagicValue(magic).into());
+    }
+
+    let _header_version = header.read_u32::<LittleEndian>()?;
+    let _total_files = header.read_u32::<LittleEndian>()?;
+    header.seek(SeekFrom::Current(40))?;
+    let _root_directory_name = header.read_length_prefixed_string()?;
+
+    let contents = read_contents(&mut header)?;
+    Ok(Filesystem { contents })
+}
+
+/// Read the contents of a directory from an archive header.
+///
+/// # Arguments
+/// * `header`  - The archive header.
+fn read_contents(header: &mut Cursor<&[u8]>) -> anyhow::Result<Vec<DirectoryEntry>> {
+    let mut contents = Vec::with_capacity(256);
+    let dir_file_qty = header.read_u32::<LittleEndian>()?;
+    for _ in 0..dir_file_qty {
+        let name = header.read_length_prefixed_string()?;
+        let offset = header.read_u64::<LittleEndian>()?;
+        let length = header.read_u32::<LittleEndian>()?;
+        let checksum = header.read_u32::<LittleEndian>()?;
+
+        contents.push(DirectoryEntry::File(File::Virtual {
+            name,
+            offset,
+            length,
+            checksum,
+        }));
+    }
+
+    let folder_qty = header.read_u32::<LittleEndian>()?;
+    for _ in 0..folder_qty {
+        let name = header.read_length_prefixed_string()?;
+        let folder_contents = read_contents(header)?;
+
+        contents.push(DirectoryEntry::Folder(Folder {
+            name,
+            contents: folder_contents,
+        }));
+    }
+    Ok(contents)
+}
+
 pub trait ShaiyaWrite {
     /// Writes a null-terminated string, where the string is prefixed
     /// with it's length as a little-endian u32.
@@ -109,6 +163,18 @@ pub trait ShaiyaWrite {
     /// # Arguments
     /// * `string`  - The string to write.
     fn put_length_prefixed_string(&mut self, string: &str);
+}
+
+pub trait ShaiyaRead {
+    /// Reads a string with a fixed number of bytes.
+    ///
+    /// # Arguments
+    /// * `length`  - The number of bytes to read.
+    fn read_fixed_length_string(&mut self, length: usize) -> anyhow::Result<String>;
+
+    /// Reads a null-terminated string, where the string is prefixed
+    /// with it's length as a little-endian u32.
+    fn read_length_prefixed_string(&mut self) -> anyhow::Result<String>;
 }
 
 impl<T> ShaiyaWrite for T
@@ -120,5 +186,26 @@ where
         self.put_u32_le((bytes.len() + 1) as u32);
         self.put_slice(bytes);
         self.put_u8(0);
+    }
+}
+
+impl<T> ShaiyaRead for T
+where
+    T: Read,
+{
+    fn read_fixed_length_string(&mut self, length: usize) -> anyhow::Result<String> {
+        let mut string = String::with_capacity(length);
+        for _ in 0..length {
+            let ch = self.read_u8()? as char;
+            if ch != '\0' {
+                string.push(ch)
+            }
+        }
+        Ok(string)
+    }
+
+    fn read_length_prefixed_string(&mut self) -> anyhow::Result<String> {
+        let length = self.read_u32::<LittleEndian>()? as usize;
+        self.read_fixed_length_string(length)
     }
 }
