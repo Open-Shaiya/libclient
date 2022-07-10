@@ -25,12 +25,7 @@ pub const DEFAULT_DATA_CAPACITY: usize = 2_000_000_000; // 2gb
 /// # Arguments
 /// * `fs`      - The virtual filesystem.
 /// * `header`  - The destination file for the header.
-/// * `data`    - The destination file for the data.
-pub fn build_filesystem(
-    fs: &Filesystem,
-    header: &mut std::fs::File,
-    data: &mut std::fs::File,
-) -> anyhow::Result<()> {
+pub fn build_filesystem(fs: &Filesystem, header: &mut std::fs::File) -> anyhow::Result<BytesMut> {
     let mut header_buf = BytesMut::with_capacity(DEFAULT_HEADER_CAPACITY);
     let mut data_buf = BytesMut::with_capacity(DEFAULT_DATA_CAPACITY);
     let total_files = write_contents(&fs.contents, &mut header_buf, &mut data_buf)?;
@@ -44,10 +39,9 @@ pub fn build_filesystem(
     out.put_slice(&header_buf);
     out.put_bytes(0, 8); // According to Parsec, the header should end with 8 null bytes (https://github.com/matigramirez/Parsec/blob/7c2e75f95bb5eaff45e22c2b30481a96a06a3016/src/Parsec/Shaiya/Data/Sah.cs#L183)
 
-    // Write the data to the files
+    // Write the data to the header, and return the data.saf buffer
     header.write_all(&out)?;
-    data.write_all(&data_buf)?;
-    Ok(())
+    Ok(data_buf)
 }
 
 /// Serialize the contents of a directory to the header and data buffer.
