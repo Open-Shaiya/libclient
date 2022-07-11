@@ -63,7 +63,7 @@ pub fn build_filesystem(fs: &Filesystem, header: &mut std::fs::File) -> anyhow::
 pub fn build_filesystem_deleting_source(
     fs: &Filesystem,
     header: &mut fs::File,
-    data: &mut Path,
+    data: &Path,
 ) -> anyhow::Result<()> {
     let mut header_buf = BytesMut::with_capacity(DEFAULT_HEADER_CAPACITY);
     let mut data_file = DataFile::Direct(data);
