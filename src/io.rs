@@ -2,7 +2,9 @@ use crate::fs::{DirectoryEntry, File, Filesystem, FilesystemError, Folder};
 use byteorder::{LittleEndian, ReadBytesExt};
 use bytes::{BufMut, BytesMut};
 use crc::{Crc, CRC_32_CKSUM};
+use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 /// The magic identifier for the header file.
 pub const SAH_HEADER_MAGIC: &str = "SAH";
@@ -19,6 +21,11 @@ pub const DEFAULT_HEADER_CAPACITY: usize = 1_000_000;
 /// The default capacity of a data.saf buffer (2gb)
 pub const DEFAULT_DATA_CAPACITY: usize = 2_000_000_000; // 2gb
 
+enum DataFile<'a> {
+    Virtual(&'a mut BytesMut),
+    Direct(&'a Path),
+}
+
 /// Builds the contents of the filesystem, into a header and data file. This allocates a 2gb buffer
 /// for the file data.
 ///
@@ -28,7 +35,8 @@ pub const DEFAULT_DATA_CAPACITY: usize = 2_000_000_000; // 2gb
 pub fn build_filesystem(fs: &Filesystem, header: &mut std::fs::File) -> anyhow::Result<BytesMut> {
     let mut header_buf = BytesMut::with_capacity(DEFAULT_HEADER_CAPACITY);
     let mut data_buf = BytesMut::with_capacity(DEFAULT_DATA_CAPACITY);
-    let total_files = write_contents(&fs.contents, &mut header_buf, &mut data_buf)?;
+    let mut data_file = DataFile::Virtual(&mut data_buf);
+    let total_files = write_contents(&fs.contents, &mut header_buf, &mut data_file, false)?;
 
     let mut out = BytesMut::new();
     out.put_slice(SAH_HEADER_MAGIC.as_bytes());
@@ -44,6 +52,37 @@ pub fn build_filesystem(fs: &Filesystem, header: &mut std::fs::File) -> anyhow::
     Ok(data_buf)
 }
 
+/// Builds the contents of the filesystem into a header and a data file. Rather than allocating memory
+/// for a buffer to contain the data, we copy the source file into memory, write it to the data file
+/// directly, and then deleting the source file.
+///
+/// # Arguments
+/// * `fs`      - The virtual filesystem.
+/// * `header`  - The destination file for the header.
+/// * `data`    - The destination file for the data.
+pub fn build_filesystem_deleting_source(
+    fs: &Filesystem,
+    header: &mut fs::File,
+    data: &mut Path,
+) -> anyhow::Result<()> {
+    let mut header_buf = BytesMut::with_capacity(DEFAULT_HEADER_CAPACITY);
+    let mut data_file = DataFile::Direct(data);
+    let total_files = write_contents(&fs.contents, &mut header_buf, &mut data_file, true)?;
+
+    let mut out = BytesMut::new();
+    out.put_slice(SAH_HEADER_MAGIC.as_bytes());
+    out.put_u32_le(HEADER_VERSION);
+    out.put_u32_le(total_files);
+    out.put_bytes(0, 40); // Unknown, assumed to be padding.
+    out.put_length_prefixed_string(ROOT_DIRECTORY_NAME);
+    out.put_slice(&header_buf);
+    out.put_bytes(0, 8); // According to Parsec, the header should end with 8 null bytes (https://github.com/matigramirez/Parsec/blob/7c2e75f95bb5eaff45e22c2b30481a96a06a3016/src/Parsec/Shaiya/Data/Sah.cs#L183)
+
+    // Write the data to the header
+    header.write_all(&out)?;
+    Ok(())
+}
+
 /// Serialize the contents of a directory to the header and data buffer.
 ///
 /// # Arguments
@@ -53,7 +92,8 @@ pub fn build_filesystem(fs: &Filesystem, header: &mut std::fs::File) -> anyhow::
 fn write_contents(
     contents: &[DirectoryEntry],
     header: &mut BytesMut,
-    data: &mut BytesMut,
+    data: &mut DataFile,
+    delete_src: bool,
 ) -> anyhow::Result<u32> {
     let (files, folders): (Vec<_>, Vec<_>) = contents
         .iter()
@@ -65,20 +105,36 @@ fn write_contents(
         match file {
             DirectoryEntry::File(f) => {
                 if let File::Direct(path) = f {
-                    let file = std::fs::File::open(path)?;
+                    let file = fs::File::open(path)?;
                     let metadata = file.metadata()?;
-                    let length = metadata.len() as u32;
+                    let file_length = metadata.len() as u32;
                     let name = path.file_name().unwrap().to_string_lossy().to_string();
 
-                    header.put_length_prefixed_string(&name);
-                    header.put_u64_le(data.len() as u64);
-                    header.put_u32_le(length);
+                    let data_offset: u64 = match data {
+                        DataFile::Virtual(buf) => buf.len() as u64,
+                        DataFile::Direct(file) => fs::metadata(&file)?.len(),
+                    };
 
-                    let file_data = std::fs::read(path)?;
-                    data.put_slice(&file_data);
+                    header.put_length_prefixed_string(&name);
+                    header.put_u64_le(data_offset);
+                    header.put_u32_le(file_length);
+
+                    let file_data = fs::read(path)?;
+                    match data {
+                        DataFile::Virtual(buf) => buf.put_slice(&file_data),
+                        DataFile::Direct(path) => {
+                            let mut file =
+                                fs::OpenOptions::new().write(true).append(true).open(path)?;
+                            file.write_all(&file_data)?;
+                        }
+                    }
 
                     let crc: Crc<u32> = Crc::<u32>::new(&CRC_32_CKSUM);
                     header.put_u32_le(crc.checksum(&file_data));
+
+                    if delete_src {
+                        fs::remove_file(path)?;
+                    }
                 }
             }
             _ => panic!("folder partitioned as file"),
@@ -89,7 +145,7 @@ fn write_contents(
         match folder {
             DirectoryEntry::Folder(f) => {
                 header.put_length_prefixed_string(&f.name);
-                total_files += write_contents(&f.contents, header, data)?;
+                total_files += write_contents(&f.contents, header, data, delete_src)?;
             }
             _ => panic!("file partitioned as a folder"),
         }
