@@ -1,4 +1,3 @@
-use bytes::BytesMut;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::fs::DirEntry;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
@@ -95,9 +94,7 @@ impl Filesystem {
         let mut header_file = tempfile::tempfile()?;
         let mut data_file = tempfile::tempfile()?;
 
-        let data_buf = crate::io::build_filesystem(self, &mut header_file)?;
-        data_file.write_all(&data_buf)?;
-
+        crate::io::build_filesystem(self, &mut header_file, &mut data_file)?;
         Ok((header_file, data_file))
     }
 
@@ -106,8 +103,12 @@ impl Filesystem {
     /// # Arguments
     /// * `header`  - The destination header file.
     /// * `data`    - The destination data file.
-    pub fn build_with_destination(&self, header: &mut std::fs::File) -> anyhow::Result<BytesMut> {
-        crate::io::build_filesystem(self, header)
+    pub fn build_with_destination<T: Write, K: Write>(
+        &self,
+        header: &mut T,
+        data: &mut K,
+    ) -> anyhow::Result<()> {
+        crate::io::build_filesystem(self, header, data)
     }
 
     /// Extracts a virtual filesystem to disk.

@@ -4,7 +4,6 @@ use bytes::{BufMut, BytesMut};
 use crc::{Crc, CRC_32_CKSUM};
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::path::Path;
 
 /// The magic identifier for the header file.
 pub const SAH_HEADER_MAGIC: &str = "SAH";
@@ -21,22 +20,20 @@ pub const DEFAULT_HEADER_CAPACITY: usize = 1_000_000;
 /// The default capacity of a data.saf buffer (2gb)
 pub const DEFAULT_DATA_CAPACITY: usize = 2_000_000_000; // 2gb
 
-enum DataFile<'a> {
-    Virtual(&'a mut BytesMut),
-    Direct(&'a Path),
-}
-
 /// Builds the contents of the filesystem, into a header and data file. This allocates a 2gb buffer
 /// for the file data.
 ///
 /// # Arguments
 /// * `fs`      - The virtual filesystem.
 /// * `header`  - The destination file for the header.
-pub fn build_filesystem(fs: &Filesystem, header: &mut std::fs::File) -> anyhow::Result<BytesMut> {
+/// * `data`    - The destination buffer to write to.
+pub fn build_filesystem<T: Write, K: Write>(
+    fs: &Filesystem,
+    header: &mut T,
+    data: &mut K,
+) -> anyhow::Result<()> {
     let mut header_buf = BytesMut::with_capacity(DEFAULT_HEADER_CAPACITY);
-    let mut data_buf = BytesMut::with_capacity(DEFAULT_DATA_CAPACITY);
-    let mut data_file = DataFile::Virtual(&mut data_buf);
-    let total_files = write_contents(&fs.contents, &mut header_buf, &mut data_file, false)?;
+    let (total_files, _) = write_contents(&fs.contents, &mut header_buf, data, 0)?;
 
     let mut out = BytesMut::new();
     out.put_slice(SAH_HEADER_MAGIC.as_bytes());
@@ -49,37 +46,6 @@ pub fn build_filesystem(fs: &Filesystem, header: &mut std::fs::File) -> anyhow::
 
     // Write the data to the header, and return the data.saf buffer
     header.write_all(&out)?;
-    Ok(data_buf)
-}
-
-/// Builds the contents of the filesystem into a header and a data file. Rather than allocating memory
-/// for a buffer to contain the data, we copy the source file into memory, write it to the data file
-/// directly, and then deleting the source file.
-///
-/// # Arguments
-/// * `fs`      - The virtual filesystem.
-/// * `header`  - The destination file for the header.
-/// * `data`    - The destination file for the data.
-pub fn build_filesystem_deleting_source(
-    fs: &Filesystem,
-    header: &mut fs::File,
-    data: &Path,
-) -> anyhow::Result<()> {
-    let mut header_buf = BytesMut::with_capacity(DEFAULT_HEADER_CAPACITY);
-    let mut data_file = DataFile::Direct(data);
-    let total_files = write_contents(&fs.contents, &mut header_buf, &mut data_file, true)?;
-
-    let mut out = BytesMut::new();
-    out.put_slice(SAH_HEADER_MAGIC.as_bytes());
-    out.put_u32_le(HEADER_VERSION);
-    out.put_u32_le(total_files);
-    out.put_bytes(0, 40); // Unknown, assumed to be padding.
-    out.put_length_prefixed_string(ROOT_DIRECTORY_NAME);
-    out.put_slice(&header_buf);
-    out.put_bytes(0, 8); // According to Parsec, the header should end with 8 null bytes (https://github.com/matigramirez/Parsec/blob/7c2e75f95bb5eaff45e22c2b30481a96a06a3016/src/Parsec/Shaiya/Data/Sah.cs#L183)
-
-    // Write the data to the header
-    header.write_all(&out)?;
     Ok(())
 }
 
@@ -89,17 +55,18 @@ pub fn build_filesystem_deleting_source(
 /// * `contents`    - The directory contents.
 /// * `header`      - The header destination.
 /// * `data`        - The data destination.
-fn write_contents(
+fn write_contents<T: Write>(
     contents: &[DirectoryEntry],
     header: &mut BytesMut,
-    data: &mut DataFile,
-    delete_src: bool,
-) -> anyhow::Result<u32> {
+    data: &mut T,
+    data_offset: u64,
+) -> anyhow::Result<(u32, u64)> {
     let (files, folders): (Vec<_>, Vec<_>) = contents
         .iter()
         .partition(|e| matches!(e, DirectoryEntry::File(_)));
     let dir_file_qty = files.len() as u32;
     let mut total_files = dir_file_qty;
+    let mut data_offset = data_offset;
     header.put_u32_le(dir_file_qty);
     for file in files {
         match file {
@@ -110,31 +77,17 @@ fn write_contents(
                     let file_length = metadata.len() as u32;
                     let name = path.file_name().unwrap().to_string_lossy().to_string();
 
-                    let data_offset: u64 = match data {
-                        DataFile::Virtual(buf) => buf.len() as u64,
-                        DataFile::Direct(file) => fs::metadata(&file)?.len(),
-                    };
-
                     header.put_length_prefixed_string(&name);
                     header.put_u64_le(data_offset);
                     header.put_u32_le(file_length);
 
+                    data_offset += file_length as u64;
+
                     let file_data = fs::read(path)?;
-                    match data {
-                        DataFile::Virtual(buf) => buf.put_slice(&file_data),
-                        DataFile::Direct(path) => {
-                            let mut file =
-                                fs::OpenOptions::new().write(true).append(true).open(path)?;
-                            file.write_all(&file_data)?;
-                        }
-                    }
+                    data.write_all(&file_data)?;
 
                     let crc: Crc<u32> = Crc::<u32>::new(&CRC_32_CKSUM);
                     header.put_u32_le(crc.checksum(&file_data));
-
-                    if delete_src {
-                        fs::remove_file(path)?;
-                    }
                 }
             }
             _ => panic!("folder partitioned as file"),
@@ -145,12 +98,15 @@ fn write_contents(
         match folder {
             DirectoryEntry::Folder(f) => {
                 header.put_length_prefixed_string(&f.name);
-                total_files += write_contents(&f.contents, header, data, delete_src)?;
+                let (inner_total_files, inner_data_offset) =
+                    write_contents(&f.contents, header, data, data_offset)?;
+                total_files += inner_total_files;
+                data_offset = inner_data_offset;
             }
             _ => panic!("file partitioned as a folder"),
         }
     }
-    Ok(total_files)
+    Ok((total_files, data_offset))
 }
 
 /// Constructs a filesystem from an archive header.
